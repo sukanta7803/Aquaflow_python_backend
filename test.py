@@ -1,12 +1,17 @@
 import os
-import sys
 import json
 from typing import Dict, Any, List
 
+from flask import Flask, jsonify
+from flask_cors import CORS
 import pandas as pd
 import folium
 from pymongo import MongoClient
 
+
+# -------------------------
+# Core data logic (ported from test.py)
+# -------------------------
 
 def get_mongo_client():
     """
@@ -109,127 +114,137 @@ def pick_collection(db) -> str:
     return 'Disease_Data'
 
 
-def main():
+def compute_payload() -> Dict[str, Any]:
+    client = get_mongo_client()
+    # Try to use database from URI, fallback to 'water'
     try:
-        client = get_mongo_client()
-        # Try to use   database from URI, fallback to 'water'
-        try:
-            db = client.get_default_database()
-        except Exception:
-            db = None
-        if db is None:
-            db_name = os.environ.get("MONGO_DB") or "water"
-            db = client[db_name]
+        db = client.get_default_database()
+    except Exception:
+        db = None
+    if db is None:
+        db_name = os.environ.get("MONGO_DB") or "water"
+        db = client[db_name]
 
-        coll_name = pick_collection(db)
-        col = db[coll_name]
+    coll_name = pick_collection(db)
+    col = db[coll_name]
 
-        cursor = col.find({}, essential_fields)
-        docs = list(cursor)
+    cursor = col.find({}, essential_fields)
+    docs = list(cursor)
 
-        if not docs:
-            # No data; return empty payload and no map
-            print(json.dumps({"redzones": [], "mapPath": None}))
-            return 0
+    if not docs:
+        return {"areas": [], "redzones": [], "mapPath": None}
 
-        df = pd.DataFrame(docs)
+    df = pd.DataFrame(docs)
 
-        # Normalize columns and types
-        for c in ["Cases", "Deaths", "Latitude", "Longitude", "year", "mon", "day"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-        if "Cases" not in df.columns:
-            df["Cases"] = 0
-        else:
-            df["Cases"] = df["Cases"].fillna(0)
-        if "Deaths" in df.columns:
-            df["Deaths"] = df["Deaths"].fillna(0)
-        if "district" not in df.columns:
-            df["district"] = ""
-        if "Disease" not in df.columns:
-            df["Disease"] = ""
+    # Normalize columns and types
+    for c in ["Cases", "Deaths", "Latitude", "Longitude", "year", "mon", "day"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    if "Cases" not in df.columns:
+        df["Cases"] = 0
+    else:
+        df["Cases"] = df["Cases"].fillna(0)
+    if "Deaths" in df.columns:
+        df["Deaths"] = df["Deaths"].fillna(0)
+    if "district" not in df.columns:
+        df["district"] = ""
+    if "Disease" not in df.columns:
+        df["Disease"] = ""
 
-        # Compute dynamic thresholds per disease using all rows
-        thresholds = compute_thresholds_per_disease(df, min_cases=50.0)
-        df["threshold"] = df["Disease"].map(thresholds).fillna(50.0)
+    # Compute dynamic thresholds per disease using all rows
+    thresholds = compute_thresholds_per_disease(df, min_cases=50.0)
+    df["threshold"] = df["Disease"].map(thresholds).fillna(50.0)
 
-        # Risk percentage per row, capped [0, 100]
-        df["outbreak_percent"] = (df["Cases"] / df["threshold"] * 100).clip(lower=0, upper=100).round(2)
-        df["outbreak_percent"] = df["outbreak_percent"].fillna(0)
-        df["band"] = df["outbreak_percent"].apply(band_from_percent)
+    # Risk percentage per row, capped [0, 100]
+    df["outbreak_percent"] = (df["Cases"] / df["threshold"] * 100).clip(lower=0, upper=100).round(2)
+    df["outbreak_percent"] = df["outbreak_percent"].fillna(0)
+    df["band"] = df["outbreak_percent"].apply(band_from_percent)
 
-        # Prepare table rows for ALL documents
-        table_rows: List[Dict[str, Any]] = []
-        df_sorted = df.sort_values(by=["outbreak_percent", "Cases"], ascending=[False, False])
-        for _, row in df_sorted.iterrows():
-            band = str(row.get("band", "green"))
-            emoji = band_emoji(band)
-            table_rows.append({
-                "state_ut": str(row.get("state_ut", "") or ""),
-                "district": str(row.get('district', '') or ''),
-                "disease": str(row.get("Disease", "") or ""),
-                "percentage": float(row.get("outbreak_percent", 0.0) or 0.0),
-                "date": row_date(row),
-                "band": band,
-                "lat": safe_float(row.get('Latitude')),
-                "lon": safe_float(row.get('Longitude')),
-                "cases": float(row.get('Cases', 0) or 0)
-            })
+    # Prepare table rows for ALL documents
+    table_rows: List[Dict[str, Any]] = []
+    df_sorted = df.sort_values(by=["outbreak_percent", "Cases"], ascending=[False, False])
+    for _, row in df_sorted.iterrows():
+        band = str(row.get("band", "green"))
+        emoji = band_emoji(band)
+        table_rows.append({
+            "state_ut": str(row.get("state_ut", "") or ""),
+            "district": str(row.get('district', '') or ''),
+            "disease": str(row.get("Disease", "") or ""),
+            "percentage": float(row.get("outbreak_percent", 0.0) or 0.0),
+            "date": row_date(row),
+            "band": band,
+            "lat": safe_float(row.get('Latitude')),
+            "lon": safe_float(row.get('Longitude')),
+            "cases": float(row.get('Cases', 0) or 0)
+        })
 
-        # Build map with ALL rows
+    # Build map with ALL rows into Node's public/maps folder
+    map_url_path = None
+    try:
+        m = folium.Map(location=[22.9734, 78.6569], zoom_start=5)
+        for _, row in df.iterrows():
+            lat = safe_float(row.get('Latitude'))
+            lon = safe_float(row.get('Longitude'))
+            if lat is None or lon is None:
+                continue
+            band = str(row.get('band', 'green'))
+            color = 'red' if band == 'red' else ('yellow' if band == 'yellow' else 'green')
+            risk = float(row.get('outbreak_percent', 0) or 0)
+            popup_text = (
+                f"State/UT: {row.get('state_ut', '')}<br>"
+                f"District: {row.get('district', '')}<br>"
+                f"Disease: {row.get('Disease', '')}<br>"
+                f"Date: {row_date(row)}<br>"
+                f"Cases: {row.get('Cases', 0)}<br>"
+                f"Risk Band: {band.capitalize()}<br>"
+                f"Outbreak %: {risk}%"
+            )
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=8,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.7,
+                popup=popup_text
+            ).add_to(m)
+
+        # Ensure map is saved under the Node app's public/maps directory
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # project root
+        maps_dir = os.path.join(base_dir, 'public', 'maps')
+        os.makedirs(maps_dir, exist_ok=True)
+        map_path = os.path.join(maps_dir, 'india_hotspot_map.html')
+        m.save(map_path)
+        map_url_path = '/maps/india_hotspot_map.html'
+    except Exception:
         map_url_path = None
-        try:
-            m = folium.Map(location=[22.9734, 78.6569], zoom_start=5)
-            for _, row in df.iterrows():
-                lat = safe_float(row.get('Latitude'))
-                lon = safe_float(row.get('Longitude'))
-                if lat is None or lon is None:
-                    continue
-                band = str(row.get('band', 'green'))
-                color = 'red' if band == 'red' else ('yellow' if band == 'yellow' else 'green')
-                risk = float(row.get('outbreak_percent', 0) or 0)
-                popup_text = (
-                    f"State/UT: {row.get('state_ut', '')}<br>"
-                    f"District: {row.get('district', '')}<br>"
-                    f"Disease: {row.get('Disease', '')}<br>"
-                    f"Date: {row_date(row)}<br>"
-                    f"Cases: {row.get('Cases', 0)}<br>"
-                    f"Risk Band: {band.capitalize()}<br>"
-                    f"Outbreak %: {risk}%"
-                )
-                folium.CircleMarker(
-                    location=[lat, lon],
-                    radius=8,
-                    color=color,
-                    fill=True,
-                    fill_color=color,
-                    fill_opacity=0.7,
-                    popup=popup_text
-                ).add_to(m)
 
-            maps_dir = os.path.join('public', 'maps')
-            os.makedirs(maps_dir, exist_ok=True)
-            map_path = os.path.join(maps_dir, 'india_hotspot_map.html')
-            m.save(map_path)
-            map_url_path = '/maps/india_hotspot_map.html'
-        except Exception:
-            map_url_path = None
+    return {"areas": table_rows, "redzones": table_rows, "mapPath": map_url_path}
 
-        # Print JSON for Node to consume; keep 'redzones' key for compatibility with EJS
-        payload = {"areas": table_rows, "redzones": table_rows, "mapPath": map_url_path}
-        sys.stdout.write(json.dumps(payload, allow_nan=False))
-        sys.stdout.flush()
-        return 0
+
+# -------------------------
+# Flask API wrapper
+# -------------------------
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"ok": True})
+
+
+@app.route('/api/predict', methods=['GET'])
+def predict():
+    try:
+        payload = compute_payload()
+        return jsonify(payload)
     except Exception as e:
-        sys.stderr.write(f"Python error: {e}\n")
-        try:
-            sys.stdout.write(json.dumps({"redzones": [], "mapPath": None}, allow_nan=False))
-            sys.stdout.flush()
-        except Exception:
-            pass
-        return 1
+        return jsonify({"redzones": [], "mapPath": None, "error": str(e)}), 500
 
 
-if __name__ == "__main__":
-    code = main()
-    sys.exit(code)
+if __name__ == '__main__':
+    host = os.environ.get('FLASK_HOST', '127.0.0.1')
+    port = int(os.environ.get('FLASK_PORT', '5000'))
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(host=host, port=port, debug=debug)
